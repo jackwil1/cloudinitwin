@@ -187,23 +187,12 @@ pub fn parse_network_config(
     .into_iter()
     .collect::<PathBuf>();
 
-    let network_config_full_path_norm =
-        network_config_full_path
-            .normalize_lexically()
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to canonicalize network config path: {}: {}",
-                    network_config_full_path.to_string_lossy(),
-                    e
-                )
-            })?;
-
     debug!(
         "Network config path: {}",
-        network_config_full_path_norm.to_string_lossy()
+        network_config_full_path.to_string_lossy()
     );
 
-    let contents = std::fs::read_to_string(&network_config_full_path_norm)
+    let contents = std::fs::read_to_string(&network_config_full_path)
         .map_err(|e| anyhow!("Failed to read network config file: {e}"))?;
 
     parse_network_config_inner(&contents)

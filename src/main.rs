@@ -1,6 +1,3 @@
-#![feature(iter_array_chunks)]
-#![feature(normalize_lexically)]
-
 mod network_config;
 mod user_data;
 mod util;
@@ -67,16 +64,16 @@ fn get_config_drive() -> Option<OsString> {
         return None;
     }
 
-    let drive_strings = drive_strings_raw
-        .into_iter()
-        .array_chunks::<DRIVE_PATH_LEN>()
-        .take_while(|chunk| chunk.iter().any(|&c| c != 0));
+    let drive_strings_slice = &drive_strings_raw[..len as usize];
+    let drive_strings = drive_strings_slice
+        .split(|&c| c == 0)
+        .filter(|s| !s.is_empty());
 
     let config_drives = drive_strings
-        .filter_map(|drive| {
-            let drive_osstr = OsString::from_wide(&drive[..3]);
+        .filter_map(|drive_slice| {
+            let drive_osstr = OsString::from_wide(drive_slice);
             let drive_str = drive_osstr.to_string_lossy();
-            let drive_path_pcwstr = PCWSTR::from_raw(drive.as_ptr());
+            let drive_path_pcwstr = PCWSTR::from_raw(drive_slice.as_ptr());
 
             let is_cdrom = unsafe { GetDriveTypeW(drive_path_pcwstr) == DRIVE_CDROM };
             if !is_cdrom {
