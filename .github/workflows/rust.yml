@@ -16,10 +16,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: Swatinem/rust-cache@v2
     - name: Build
       run: cargo build --release --verbose
     - name: Package
-      #if: github.ref_type == 'tag'
+      if: github.ref_type == 'tag'
       run: 7z a cloudinitwin.zip target/release/cloudinitwin.exe "scripts/*"
     - name: Release
       if: github.ref_type == 'tag'
