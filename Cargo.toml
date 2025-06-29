@@ -1,0 +1,48 @@
+[package]
+name = "cloudinitwin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+log = "0.4.27"
+serde_json = "1.0.140"
+serde_yaml_ng = "0.10.0"
+flexi_logger = "0.31.1"
+anyhow = "1.0.98"
+nom = "8.0.0"
+scopeguard = "1.2.0"
+windows-service = "0.8.0"
+retry = "2.1.0"
+
+[dependencies.secrecy]
+version = "0.10.3"
+features = [
+    "serde"
+]
+
+[dependencies.serde]
+version = "1.0.219"
+features = [
+    "derive"
+]
+
+[dependencies.windows]
+version = "0.61.3"
+features = [
+    "Win32_Foundation",
+    "Win32_Storage",
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+    "Win32_Globalization",
+    "Win32_System_Registry",
+    "Win32_System_Com",
+    "Win32_System_SystemInformation",
+    "Win32_System_Shutdown",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_Networking",
+    "Win32_Networking_ActiveDirectory",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_UI_Shell",
+]
