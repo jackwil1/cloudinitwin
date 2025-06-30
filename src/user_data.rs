@@ -275,14 +275,17 @@ pub fn handle_user_data(user_data: &mut UserData) -> anyhow::Result<bool> {
         debug!("Adding SSH authorized keys",);
 
         // Enable windows SSH
-        info!("Installing and enabling Windows OpenSSH service");
+        info!("Installing and enabling Windows SSH server service");
         util::run_powershell_command(
             r#"Add-WindowsCapability -Online -Name OpenSSH.Server;
             Start-Service sshd;
             Set-Service -Name sshd -StartupType "Automatic"
-            if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue | Select-Object Name, Enabled)) {
-                New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22
-            }"#).map_err(|e| anyhow!("Failed to install and enable Windows SSH service: {e}"))?;
+            if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+                New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Any
+            }
+            if (!(Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue)) {
+                New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -PropertyType String -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Force
+            }"#).map_err(|e| anyhow!("Failed to install Windows SSH server service: {e}"))?;
 
         for key in &user_data.ssh_authorized_keys {
             info!("Adding SSH key: {}", key);

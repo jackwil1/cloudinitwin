@@ -46,30 +46,7 @@ sc.exe description $serviceName "Runs the CloudInitWin application."
 Write-Host "Service '$serviceName' created successfully."
 
 # Install OpenSSH
-Write-Host "Installing OpenSSH"
+Write-Host "Installing OpenSSH Server"
 Add-WindowsCapability -Online -Name OpenSSH.Server;
-Start-Service sshd;
-Set-Service -Name sshd -StartupType "Automatic"
-$firewallParams = @{
-    Name        = 'OpenSSH-Server-In-TCP'
-    DisplayName = 'Inbound rule for OpenSSH Server on TCP port 22'
-    Action      = 'Allow'
-    Direction   = 'Inbound'
-    Enabled     = 'True'
-    Profile     = 'Any'
-    Protocol    = 'TCP'
-    LocalPort   = 22
-}
-if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue | Select-Object Name, Enabled)) {
-    New-NetFirewallRule @firewallParams
-}
-$shellParams = @{
-    Path         = 'HKLM:\SOFTWARE\OpenSSH'
-    Name         = 'DefaultShell'
-    Value        = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    PropertyType = 'String'
-    Force        = $true
-}
-New-ItemProperty @shellParams
 
 Write-Host "Installation complete."
