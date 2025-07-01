@@ -1,7 +1,7 @@
 use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
 
 use anyhow::anyhow;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use secrecy::{ExposeSecret, SecretBox};
 use serde::Deserialize;
 use windows::{
@@ -222,11 +222,79 @@ fn get_ssh_dir() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_wide(unsafe { program_data_path.as_wide() })).join("ssh"))
 }
 
+fn handle_ssh_keys(ssh_authorized_keys: &Vec<String>) -> anyhow::Result<()> {
+    if ssh_authorized_keys.is_empty() {
+        debug!("No SSH authorized keys provided, skipping SSH setup");
+        return Ok(());
+    }
+
+    // Enable windows SSH
+    info!("Installing and enabling Windows SSH server service");
+    if let Err(e) = util::run_powershell_command(
+        r#"Add-WindowsCapability -Online -Name OpenSSH.Server;
+        Start-Service sshd;
+        Set-Service -Name sshd -StartupType "Automatic"
+        if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Any
+        }
+        if (!(Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue)) {
+            New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -PropertyType String -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Force
+        }"#,
+    ) {
+        error!("Failed to install and enable Windows SSH server service: {e}");
+    }
+
+    info!("Adding SSH authorized keys");
+
+    // Create the authorized_keys file if it doesn't exist
+    let ssh_dir = get_ssh_dir().map_err(|e| anyhow!("Failed to get ssh dir: {e}"))?;
+    if !ssh_dir.exists() {
+        return Err(anyhow!(
+            "SSH directory does not exist: {}",
+            ssh_dir.to_string_lossy()
+        ));
+    }
+    let authorized_keys_path = ssh_dir.join("administrators_authorized_keys");
+    if !authorized_keys_path.exists() {
+        info!(
+            "Creating authorized_keys file at: {}",
+            authorized_keys_path.to_string_lossy()
+        );
+        std::fs::File::create(&authorized_keys_path)
+            .map_err(|e| anyhow!("Failed to create authorized_keys file: {e}"))?;
+
+        debug!("Setting permissions for administrators_authorized_keys file");
+        if let Err(e) = util::run_powershell_command(&format!(
+            r#"icacls.exe $env:ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" "#
+        )) {
+            error!("Failed to set permissions for administrators_authorized_keys file: {e}");
+        }
+    }
+
+    for key in ssh_authorized_keys {
+        debug!("Handling SSH key: {}", key);
+
+        // Add the SSH key to the authorized_keys file if it's not already present
+        let mut authorized_keys_content = std::fs::read_to_string(&authorized_keys_path)
+            .map_err(|e| anyhow!("Failed to read authorized_keys file: {e}"))?;
+        if !authorized_keys_content.contains(key) {
+            info!("Adding key to authorized_keys file: {}", key);
+            authorized_keys_content.push_str(&format!("\n{key}\n"));
+            std::fs::write(&authorized_keys_path, authorized_keys_content)
+                .map_err(|e| anyhow!("Failed to write to authorized_keys file: {e}"))?;
+        } else {
+            info!("SSH key already exists in authorized_keys file: {}", key);
+        }
+    }
+
+    Ok(())
+}
+
 pub fn handle_user_data(user_data: &mut UserData) -> anyhow::Result<bool> {
     debug!("Handling user data: {:?}", user_data);
 
     if user_data.disable_root {
-        return Err(anyhow!("disable_root is not supported"));
+        warn!("disable_root is not supported");
     }
 
     let user: String = match (&user_data.users, &user_data.user) {
@@ -260,72 +328,22 @@ pub fn handle_user_data(user_data: &mut UserData) -> anyhow::Result<bool> {
     if let Some(password) = &user_data.password.expose_secret() {
         info!("Updating {user} password");
 
-        set_user_password(&user, password, user_data.chpasswd.expire)
-            .map_err(|e| anyhow!("Failed to set user {user} password: {e}"))?;
+        if let Err(e) = set_user_password(&user, password, user_data.chpasswd.expire) {
+            error!("Failed to set password for user {user}: {e}");
+        }
     }
 
     // Add user to administrators group if it's not already a member
-    util::run_powershell_command(&format!(
+    if let Err(e) = util::run_powershell_command(&format!(
         r#"if (!(Get-LocalGroupMember -Group "Administrators" -Member "{user}" -ErrorAction SilentlyContinue)) {{
             Add-LocalGroupMember -Group "Administrators" -Member "{user}"
         }}"#
-    )).map_err(|e| anyhow!("Failed to add user {user} to Administrators group: {e}"))?;
+    )) {
+        error!("Failed to add user {user} to Administrators group: {e}");
+    }
 
-    if !user_data.ssh_authorized_keys.is_empty() {
-        debug!("Adding SSH authorized keys",);
-
-        // Enable windows SSH
-        info!("Installing and enabling Windows SSH server service");
-        util::run_powershell_command(
-            r#"Add-WindowsCapability -Online -Name OpenSSH.Server;
-            Start-Service sshd;
-            Set-Service -Name sshd -StartupType "Automatic"
-            if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
-                New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Any
-            }
-            if (!(Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue)) {
-                New-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -PropertyType String -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Force
-            }"#).map_err(|e| anyhow!("Failed to install Windows SSH server service: {e}"))?;
-
-        for key in &user_data.ssh_authorized_keys {
-            info!("Adding SSH key: {}", key);
-
-            // Create the authorized_keys file if it doesn't exist
-            let ssh_dir = get_ssh_dir().map_err(|e| anyhow!("Failed to get ssh dir: {e}"))?;
-            if !ssh_dir.exists() {
-                return Err(anyhow!(
-                    "SSH directory does not exist: {}",
-                    ssh_dir.to_string_lossy()
-                ));
-            }
-            let authorized_keys_path = ssh_dir.join("administrators_authorized_keys");
-            if !authorized_keys_path.exists() {
-                info!(
-                    "Creating authorized_keys file at: {}",
-                    authorized_keys_path.to_string_lossy()
-                );
-                std::fs::File::create(&authorized_keys_path)
-                    .map_err(|e| anyhow!("Failed to create authorized_keys file: {e}"))?;
-
-                debug!("Setting permissions for administrators_authorized_keys file");
-                util::run_powershell_command(&format!(
-                    r#"icacls.exe $env:ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" "#
-                ))
-                    .map_err(|e| anyhow!("Failed to configure administrators_authorized_keys permissions: {e}"))?;
-            }
-
-            // Add the SSH key to the authorized_keys file if it's not already present
-            let mut authorized_keys_content = std::fs::read_to_string(&authorized_keys_path)
-                .map_err(|e| anyhow!("Failed to read authorized_keys file: {e}"))?;
-            if !authorized_keys_content.contains(key) {
-                info!("Adding key to authorized_keys file: {}", key);
-                authorized_keys_content.push_str(&format!("\n{key}\n"));
-                std::fs::write(&authorized_keys_path, authorized_keys_content)
-                    .map_err(|e| anyhow!("Failed to write to authorized_keys file: {e}"))?;
-            } else {
-                info!("SSH key already exists in authorized_keys file: {}", key);
-            }
-        }
+    if let Err(e) = handle_ssh_keys(&user_data.ssh_authorized_keys) {
+        error!("Failed to handle SSH authorized keys: {e}");
     }
 
     if user_data.manage_etc_hosts {
@@ -336,6 +354,14 @@ pub fn handle_user_data(user_data: &mut UserData) -> anyhow::Result<bool> {
         warn!("package_upgrade is not supported");
     }
 
-    Ok(update_hostname(&user_data.hostname, &user_data.fqdn)
-        .map_err(|e| anyhow!("Failed to update hostname: {e}"))?)
+    match update_hostname(&user_data.hostname, &user_data.fqdn) {
+        Ok(needs_restart) => {
+            return Ok(needs_restart);
+        }
+        Err(e) => {
+            error!("Failed to update hostname: {e}");
+        }
+    }
+
+    Ok(false)
 }

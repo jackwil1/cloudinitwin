@@ -214,21 +214,71 @@ fn wait_for_internet_connection(timeout: std::time::Duration) -> bool {
     return false;
 }
 
-pub fn handle_network_config(network_config: NetworkConfig) -> anyhow::Result<()> {
-    fn netmask_to_prefix(netmask: IpAddr) -> anyhow::Result<u8> {
-        match netmask {
-            IpAddr::V4(mask) => {
-                let mask_u32 = u32::from(mask);
-                if (!mask_u32).wrapping_add(1).is_power_of_two() || mask_u32 == u32::MAX {
-                    Ok(mask_u32.count_ones() as u8)
-                } else {
-                    Err(anyhow!("Invalid netmask: {}", mask))
-                }
+fn netmask_to_prefix(netmask: IpAddr) -> anyhow::Result<u8> {
+    match netmask {
+        IpAddr::V4(mask) => {
+            let mask_u32 = u32::from(mask);
+            if (!mask_u32).wrapping_add(1).is_power_of_two() || mask_u32 == u32::MAX {
+                Ok(mask_u32.count_ones() as u8)
+            } else {
+                Err(anyhow!("Invalid netmask: {}", mask))
             }
-            IpAddr::V6(_) => Err(anyhow!("IPv6 is not supported yet")),
+        }
+        IpAddr::V6(_) => Err(anyhow!("IPv6 is not supported yet")),
+    }
+}
+
+fn handle_network_interface(
+    iface_num: u8,
+    config: &InterfaceConfig,
+    adaptor_indices: &Vec<u32>,
+) -> anyhow::Result<()> {
+    let iface_num_usize = iface_num as usize;
+    if iface_num_usize >= adaptor_indices.len() {
+        return Err(anyhow!(
+            "Interface eth{} not found. Only {} physical interfaces detected.",
+            iface_num,
+            adaptor_indices.len()
+        ));
+    }
+    let interface_index = adaptor_indices[iface_num_usize];
+
+    match config.mode {
+        InterfaceMode::Dhcp => {
+            util::run_powershell_command(&format!(
+                "Get-NetIPAddress -InterfaceIndex {0} | Remove-NetIPAddress -Confirm:$false; Set-NetIPInterface -InterfaceIndex {0} -Dhcp Enabled",
+                interface_index
+            ))?;
+        }
+        InterfaceMode::Static => {
+            let address = config
+                .address
+                .ok_or_else(|| anyhow!("Static config for eth{iface_num} missing address"))?;
+            let netmask = config
+                .netmask
+                .ok_or_else(|| anyhow!("Static config for eth{iface_num} missing netmask"))?;
+            let gateway = config.gateway.ok_or_else(|| {
+                anyhow!("Static config for eth{iface_num} missing default gateway")
+            })?;
+            let prefix_length = netmask_to_prefix(netmask)?;
+
+            util::run_powershell_command(&format!(
+                r#"
+                Set-NetIPInterface -InterfaceIndex {interface_index} -AddressFamily IPv6 -RouterDiscovery Disabled -Dhcp Disabled;
+                Set-NetIPInterface -InterfaceIndex {interface_index} -AddressFamily IPv4 -Dhcp Disabled;
+                Get-NetIPAddress -InterfaceIndex {interface_index} | Remove-NetIPAddress -Confirm:$false;
+                Remove-NetRoute -InterfaceIndex {interface_index} -Confirm:$false;
+                New-NetIPAddress -InterfaceIndex {interface_index} -IPAddress '{address}' -PrefixLength {prefix_length} -DefaultGateway '{gateway}';
+                Set-DnsClientServerAddress -InterfaceIndex {interface_index} -ServerAddresses @('{gateway}')
+                "#
+            ))?;
         }
     }
 
+    Ok(())
+}
+
+pub fn handle_network_config(network_config: NetworkConfig) -> anyhow::Result<()> {
     let adaptor_indices = util::run_powershell_command(
         r#"Get-NetAdapter -Physical | Where-Object { $_.Name -like "Ethernet*" } | Sort-Object InterfaceIndex | Select-Object -ExpandProperty InterfaceIndex"#,
     )
@@ -240,54 +290,19 @@ pub fn handle_network_config(network_config: NetworkConfig) -> anyhow::Result<()
     for (iface_num, config) in network_config {
         info!("Configuring interface eth{}: {:?}", iface_num, config);
 
-        let iface_num_usize = iface_num as usize;
-        if iface_num_usize >= adaptor_indices.len() {
-            return Err(anyhow!(
-                "Interface eth{} not found. Only {} physical interfaces detected.",
-                iface_num,
-                adaptor_indices.len()
-            ));
-        }
-        let interface_index = adaptor_indices[iface_num_usize];
-
-        match config.mode {
-            InterfaceMode::Dhcp => {
-                util::run_powershell_command(&format!(
-                    "Get-NetIPAddress -InterfaceIndex {0} | Remove-NetIPAddress -Confirm:$false; Set-NetIPInterface -InterfaceIndex {0} -Dhcp Enabled",
-                    interface_index
-                ))?;
-            }
-            InterfaceMode::Static => {
-                let address = config
-                    .address
-                    .ok_or_else(|| anyhow!("Static config for eth{iface_num} missing address"))?;
-                let netmask = config
-                    .netmask
-                    .ok_or_else(|| anyhow!("Static config for eth{iface_num} missing netmask"))?;
-                let gateway = config.gateway.ok_or_else(|| {
-                    anyhow!("Static config for eth{iface_num} missing default gateway")
-                })?;
-                let prefix_length = netmask_to_prefix(netmask)?;
-
-                util::run_powershell_command(&format!(
-                    r#"
-                    Set-NetIPInterface -InterfaceIndex {interface_index} -AddressFamily IPv6 -RouterDiscovery Disabled -Dhcp Disabled;
-                    Set-NetIPInterface -InterfaceIndex {interface_index} -AddressFamily IPv4 -Dhcp Disabled;
-                    Get-NetIPAddress -InterfaceIndex {interface_index} | Remove-NetIPAddress -Confirm:$false;
-                    Remove-NetRoute -InterfaceIndex {interface_index} -Confirm:$false;
-                    New-NetIPAddress -InterfaceIndex {interface_index} -IPAddress '{address}' -PrefixLength {prefix_length} -DefaultGateway '{gateway}';
-                    Set-DnsClientServerAddress -InterfaceIndex {interface_index} -ServerAddresses @('{gateway}')
-                    "#
-                ))?;
-
-                std::thread::sleep(std::time::Duration::from_secs(1));
-
-                // Wait for internet connectivity
-                if !wait_for_internet_connection(std::time::Duration::from_secs(30)) {
-                    warn!("Failed to connect to internet");
-                }
-            }
+        if let Err(e) = handle_network_interface(iface_num, &config, &adaptor_indices) {
+            warn!("Failed to configure interface eth{}: {}", iface_num, e);
+        } else {
+            info!("Interface eth{} configured successfully", iface_num);
         }
     }
+
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Wait for internet connectivity
+    if !wait_for_internet_connection(std::time::Duration::from_secs(30)) {
+        warn!("Failed to connect to internet");
+    }
+
     Ok(())
 }

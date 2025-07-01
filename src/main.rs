@@ -333,13 +333,23 @@ fn run_service(install_dir: &PathBuf) -> anyhow::Result<()> {
 
     // Handle user data first so it is more likely that we will be able to log in in the case of any errors
     info!("Handling user data");
-    let needs_restart = user_data::handle_user_data(&mut user_data)?;
+    let needs_restart = match user_data::handle_user_data(&mut user_data) {
+        Ok(needs_restart) => needs_restart,
+        Err(e) => {
+            error!("Failed to handle user data: {e}");
+            false
+        }
+    };
 
     info!("Handling network config");
-    network_config::handle_network_config(network_config)?;
+    if let Err(e) = network_config::handle_network_config(network_config) {
+        error!("Failed to handle network config: {e}");
+    }
 
     if needs_restart {
-        schedule_reboot().map_err(|e| anyhow!("Failed to schedule reboot: {e}"))?;
+        if let Err(e) = schedule_reboot() {
+            error!("Failed to schedule reboot: {e}");
+        }
         info!("Reboot scheduled successfully");
     } else {
         info!("No reboot needed");
