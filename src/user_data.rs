@@ -54,7 +54,7 @@ pub fn parse_user_data(config_drive: &OsString) -> anyhow::Result<UserData> {
     debug!("User data path: {}", user_data_path.to_string_lossy());
 
     let contents = std::fs::read_to_string(&user_data_path)
-        .map_err(|e| anyhow!("Failed to read user data file: {}", e))?;
+        .map_err(|e| anyhow!("Failed to read user data file: {e}"))?;
 
     // Quote the `password: ...` value if it exists since it may otherwise be malformed yaml
     let contents_safe = contents
@@ -79,7 +79,7 @@ pub fn parse_user_data(config_drive: &OsString) -> anyhow::Result<UserData> {
 }
 
 fn set_user_password(user: &str, password: &str, expire: bool) -> anyhow::Result<()> {
-    debug!("Setting password for user: {}", user);
+    debug!("Setting password for {user}");
     let user_path: Vec<u16> = format!("WinNT://./{user}")
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -131,7 +131,7 @@ fn set_user_password(user: &str, password: &str, expire: bool) -> anyhow::Result
 fn update_hostname(hostname: &str, fqdn: &str) -> anyhow::Result<bool> {
     let mut needs_restart = false;
 
-    debug!("Updating hostname to: {}", hostname);
+    debug!("Updating hostname to: {hostname}");
 
     let hostname_wide = hostname
         .encode_utf16()
@@ -166,11 +166,11 @@ fn update_hostname(hostname: &str, fqdn: &str) -> anyhow::Result<bool> {
 
         needs_restart = true;
     } else {
-        debug!("DnsHostname is already set to: {}", hostname);
+        debug!("DnsHostname is already set to: {hostname}");
     }
 
     if let Some((_, suffix)) = fqdn.split_once('.') {
-        debug!("Setting DNS domain to: {}", suffix);
+        debug!("Setting DNS domain to: {suffix}");
 
         let suffix_wide = suffix
             .encode_utf16()
@@ -205,7 +205,7 @@ fn update_hostname(hostname: &str, fqdn: &str) -> anyhow::Result<bool> {
 
             needs_restart = true;
         } else {
-            debug!("DnsDomain is already set to: {}", suffix);
+            debug!("DnsDomain is already set to: {suffix}");
         }
     } else {
         info!("FQDN does not contain a domain suffix, skipping DNS domain");

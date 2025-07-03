@@ -1,6 +1,7 @@
 mod network_config;
 mod user_data;
 mod util;
+mod volumes;
 
 use std::{
     collections::HashMap, ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf,
@@ -19,7 +20,10 @@ use windows::{
         },
         Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW},
         System::{
-            Com::{CoInitialize, CoUninitialize},
+            Com::{
+                COINIT_MULTITHREADED, CoInitializeEx, CoInitializeSecurity, CoUninitialize,
+                EOAC_NONE, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+            },
             Diagnostics::Debug::OutputDebugStringW,
             Registry::HKEY_LOCAL_MACHINE,
             Shutdown::{
@@ -155,9 +159,8 @@ fn parse_metadata(config_drive: &OsString) -> anyhow::Result<Metadata> {
 
     let contents = std::fs::read_to_string(&metadata_path).map_err(|e| {
         anyhow!(
-            "Failed to read metadata file '{}': {}",
-            metadata_path.to_string_lossy(),
-            e
+            "Failed to read metadata file '{}': {e}",
+            metadata_path.to_string_lossy()
         )
     })?;
 
@@ -227,7 +230,7 @@ fn get_install_dir() -> anyhow::Result<PathBuf> {
 fn configure_working_dir(install_dir: &PathBuf) -> anyhow::Result<()> {
     // This should have been created by the installer or even the logger library
     if !std::fs::exists(&install_dir)
-        .map_err(|e| anyhow!("Failed to check if install dir exists: {}", e))?
+        .map_err(|e| anyhow!("Failed to check if install dir exists: {e}"))?
     {
         return Err(anyhow!(
             "Install dir does not exist: {}",
@@ -237,9 +240,8 @@ fn configure_working_dir(install_dir: &PathBuf) -> anyhow::Result<()> {
 
     std::env::set_current_dir(&install_dir).map_err(|e| {
         anyhow!(
-            "set_current_dir failed for '{}': {}",
-            install_dir.to_string_lossy(),
-            e
+            "set_current_dir failed for '{}': {e}",
+            install_dir.to_string_lossy()
         )
     })?;
 
@@ -313,23 +315,38 @@ fn run_service(install_dir: &PathBuf) -> anyhow::Result<()> {
     info!("Using config drive: {}", drive.to_string_lossy());
 
     let metadata = parse_metadata(&drive)?;
-    info!("Read metadata: {:?}", metadata);
+    info!("Read metadata: {metadata:?}");
 
     let network_config =
         network_config::parse_network_config(&metadata.network_config.content_path, &drive)?;
-    info!("Read network config: {:?}", network_config);
+    info!("Read network config: {network_config:?}");
 
     let mut user_data = user_data::parse_user_data(&drive)?;
-    info!("Read user data: {:?}", user_data);
+    info!("Read user data: {user_data:?}");
 
     info!("Initializing COM");
-    unsafe { CoInitialize(None) }
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
         .ok()
         .map_err(|e| anyhow!("CoInitialize failed: {e}"))?;
     scopeguard::defer! {
         info!("Uninitializing COM");
         unsafe { CoUninitialize() };
     }
+
+    unsafe {
+        CoInitializeSecurity(
+            None,
+            -1,
+            None,
+            None,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            None,
+            EOAC_NONE,
+            None,
+        )
+    }
+    .map_err(|e| anyhow!("CoInitializeSecurity failed: {e:?}"))?;
 
     // Handle user data first so it is more likely that we will be able to log in in the case of any errors
     info!("Handling user data");
@@ -345,6 +362,11 @@ fn run_service(install_dir: &PathBuf) -> anyhow::Result<()> {
     if let Err(e) = network_config::handle_network_config(network_config) {
         error!("Failed to handle network config: {e}");
     }
+
+    info!("Extending partitions");
+    volumes::extend_partitions().map_err(|e| anyhow!("Failed to extend partitions: {e}"))?;
+
+    info!("Configuration finished");
 
     if needs_restart {
         if let Err(e) = schedule_reboot() {
@@ -400,10 +422,9 @@ fn service_main(_arguments: Vec<OsString>) {
             info!("CloudInitWin run completed successfully");
         }
         Err(e) => {
-            error!("CloudInitWin run failed: {}", e);
+            error!("CloudInitWin run failed: {e}");
         }
     }
-    //}
 
     status_handle
         .set_service_status(ServiceStatus {
