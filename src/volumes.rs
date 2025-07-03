@@ -8,28 +8,26 @@ use windows::Win32::System::Wmi::{
 };
 use windows::core::{BSTR, GUID, w};
 
+use crate::util;
+
 fn get_resizable_partitions(server: &IWbemServices) -> anyhow::Result<Vec<(String, BSTR)>> {
     let mut resizable_partitions = Vec::new();
 
-    let query = unsafe {
+    let query = util::retry_std(|| unsafe {
         server.ExecQuery(
             &BSTR::from("WQL"),
             &BSTR::from(format!("SELECT * FROM MSFT_Partition")),
             WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
             None,
         )
-    }
+    })
     .map_err(|e| anyhow::anyhow!("Failed to execute WMI query: {e}"))?;
 
     loop {
         let mut row = [None; 1];
         let mut returned = 0;
-        unsafe {
-            query
-                .Next(WBEM_INFINITE, &mut row, &mut returned)
-                .ok()
-                .map_err(|e| anyhow::anyhow!("Failed to retrieve next row: {e}"))?
-        };
+        util::retry_std(|| unsafe { query.Next(WBEM_INFINITE, &mut row, &mut returned).ok() })
+            .map_err(|e| anyhow::anyhow!("Failed to retrieve next row: {e}"))?;
 
         if row[0].is_none() {
             break;
@@ -38,7 +36,7 @@ fn get_resizable_partitions(server: &IWbemServices) -> anyhow::Result<Vec<(Strin
 
         // Check that the partition should be resized
         let mut gpt_type = VARIANT::default();
-        unsafe { row.Get(w!("GptType"), 0, &mut gpt_type, None, None) }
+        util::retry_std(|| unsafe { row.Get(w!("GptType"), 0, &mut gpt_type, None, None) })
             .map_err(|e| anyhow::anyhow!("Failed to get GptType: {e}"))?;
 
         let gpt_type_str = gpt_type.to_string();
@@ -56,14 +54,14 @@ fn get_resizable_partitions(server: &IWbemServices) -> anyhow::Result<Vec<(Strin
 
         // Get the partition letter and base path
         let mut drive_letter = VARIANT::default();
-        unsafe { row.Get(w!("DriveLetter"), 0, &mut drive_letter, None, None) }
+        util::retry_std(|| unsafe { row.Get(w!("DriveLetter"), 0, &mut drive_letter, None, None) })
             .map_err(|e| anyhow::anyhow!("Failed to get DriveLetter: {e}"))?;
         let drive_letter_int: i32 = unsafe { drive_letter.Anonymous.Anonymous.Anonymous.intVal };
         let drive_letter_char = char::from_u32(drive_letter_int as u32)
             .ok_or_else(|| anyhow::anyhow!("Invalid DriveLetter value: {drive_letter_int}"))?;
 
         let mut base_path = VARIANT::default();
-        unsafe { row.Get(w!("__PATH"), 0, &mut base_path, None, None) }
+        util::retry_std(|| unsafe { row.Get(w!("__PATH"), 0, &mut base_path, None, None) })
             .map_err(|e| anyhow::anyhow!("Failed to get __PATH: {e}"))?;
         let base_path_bstr = BSTR::from(base_path.to_string());
 
@@ -81,20 +79,20 @@ fn get_partition_max_size(
     let get_supported_size_name = BSTR::from("GetSupportedSize");
 
     let mut get_supported_size_output_signature = None;
-    unsafe {
+    util::retry_std(|| unsafe {
         msft_partition_class.GetMethod(
             &get_supported_size_name,
             0,
             std::ptr::null_mut(),
             &mut get_supported_size_output_signature,
         )
-    }
+    })
     .map_err(|e| anyhow::anyhow!("Failed to get GetSupportedSize method: {e}"))?;
     get_supported_size_output_signature
         .ok_or_else(|| anyhow::anyhow!("GetSupportedSize output signature was None"))?;
 
     let mut out_params = None;
-    unsafe {
+    util::retry_std(|| unsafe {
         server.ExecMethod(
             &partition_path,
             &get_supported_size_name,
@@ -104,14 +102,14 @@ fn get_partition_max_size(
             Some(&mut out_params),
             None,
         )
-    }
+    })
     .map_err(|e| anyhow::anyhow!("Failed to execute GetSupportedSize method: {e}"))?;
 
     let out_params =
         out_params.ok_or_else(|| anyhow::anyhow!("Output from GetSupportedSize was None"))?;
 
     let mut size_max = VARIANT::default();
-    unsafe { out_params.Get(w!("SizeMax"), 0, &mut size_max, None, None) }
+    util::retry_std(|| unsafe { out_params.Get(w!("SizeMax"), 0, &mut size_max, None, None) })
         .map_err(|e| anyhow::anyhow!("Failed to get SizeMax: {e}"))?;
 
     Ok(size_max)
@@ -127,26 +125,26 @@ fn resize_partition(
 
     let mut resize_input_signature = None;
     let mut resize_output_signature = None;
-    unsafe {
+    util::retry_std(|| unsafe {
         msft_partition_class.GetMethod(
             &resize_name,
             0,
             &mut resize_input_signature,
             &mut resize_output_signature,
         )
-    }
+    })
     .map_err(|e| anyhow::anyhow!("Failed to get Resize method: {e}"))?;
     let resize_input_signature =
         resize_input_signature.ok_or_else(|| anyhow::anyhow!("Resize input signature was None"))?;
     resize_output_signature.ok_or_else(|| anyhow::anyhow!("Resize output signature was None"))?;
 
-    let in_params = unsafe { resize_input_signature.SpawnInstance(0) }
+    let in_params = util::retry_std(|| unsafe { resize_input_signature.SpawnInstance(0) })
         .map_err(|e| anyhow::anyhow!("Failed to spawn Resize input instance: {e}"))?;
-    unsafe { in_params.Put(&BSTR::from("Size"), 0, &new_size, 0) }
+    util::retry_std(|| unsafe { in_params.Put(&BSTR::from("Size"), 0, &new_size, 0) })
         .map_err(|e| anyhow::anyhow!("Failed to set Size in Resize input: {e}"))?;
 
     let mut out_params = None;
-    unsafe {
+    util::retry_std(|| unsafe {
         server.ExecMethod(
             &partition_path,
             &resize_name,
@@ -156,7 +154,7 @@ fn resize_partition(
             Some(&mut out_params),
             None,
         )
-    }
+    })
     .map_err(|e| anyhow::anyhow!("Failed to execute Resize method: {e}"))?;
 
     Ok(())
@@ -164,10 +162,10 @@ fn resize_partition(
 
 pub fn extend_partitions() -> anyhow::Result<()> {
     let locator: IWbemLocator =
-        unsafe { CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER) }
+        util::retry_std(|| unsafe { CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER) })
             .map_err(|e| anyhow::anyhow!("Failed to create WbemLocator instance: {e}"))?;
 
-    let server = unsafe {
+    let server = util::retry_std(|| unsafe {
         locator.ConnectServer(
             &BSTR::from("ROOT\\Microsoft\\Windows\\Storage"),
             &BSTR::default(),
@@ -177,7 +175,7 @@ pub fn extend_partitions() -> anyhow::Result<()> {
             &BSTR::default(),
             None,
         )
-    }
+    })
     .map_err(|e| anyhow::anyhow!("Failed to connect to WMI server: {e}"))?;
 
     let class_name = BSTR::from("MSFT_Partition");

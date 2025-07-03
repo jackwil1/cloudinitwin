@@ -7,13 +7,9 @@ use serde::Deserialize;
 use windows::{
     Win32::{
         Networking::ActiveDirectory::IADsUser,
-        System::SystemInformation::{
-            ComputerNamePhysicalDnsDomain, ComputerNamePhysicalDnsHostname, GetComputerNameExW,
-            SetComputerNameExW,
-        },
-        UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath, StrCmpW},
+        UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
     },
-    core::{BSTR, Interface, PCWSTR, PWSTR},
+    core::{BSTR, Interface, PCWSTR},
 };
 
 use crate::util;
@@ -25,9 +21,9 @@ pub struct PasswordPolicy {
 
 #[derive(Deserialize, Debug)]
 pub struct UserData {
-    hostname: String,
+    pub hostname: String,
     manage_etc_hosts: bool,
-    fqdn: String,
+    pub fqdn: String,
 
     user: Option<String>,
     users: Option<Vec<String>>,
@@ -128,92 +124,6 @@ fn set_user_password(user: &str, password: &str, expire: bool) -> anyhow::Result
     Ok(())
 }
 
-fn update_hostname(hostname: &str, fqdn: &str) -> anyhow::Result<bool> {
-    let mut needs_restart = false;
-
-    debug!("Updating hostname to: {hostname}");
-
-    let hostname_wide = hostname
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<u16>>();
-
-    let mut buffer = [0u16; 512 + 1];
-    let mut nsize = 512;
-    unsafe {
-        GetComputerNameExW(
-            ComputerNamePhysicalDnsHostname,
-            Some(PWSTR(buffer.as_mut_ptr())),
-            &mut nsize,
-        )
-    }
-    .map_err(|e| anyhow!("GetComputerNameExW failed for DnsHostname: {e}"))?;
-
-    if unsafe {
-        StrCmpW(
-            PCWSTR(buffer.as_ptr()),
-            PCWSTR::from_raw(hostname_wide.as_ptr()),
-        )
-    } != 0
-    {
-        util::retry_std(|| unsafe {
-            SetComputerNameExW(
-                ComputerNamePhysicalDnsHostname,
-                PCWSTR::from_raw(hostname_wide.as_ptr()),
-            )
-        })
-        .map_err(|e| anyhow!("SetComputerNameExW failed for DnsHostname: {e}"))?;
-
-        needs_restart = true;
-    } else {
-        debug!("DnsHostname is already set to: {hostname}");
-    }
-
-    if let Some((_, suffix)) = fqdn.split_once('.') {
-        debug!("Setting DNS domain to: {suffix}");
-
-        let suffix_wide = suffix
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect::<Vec<u16>>();
-
-        buffer.fill(0);
-        nsize = 512;
-        unsafe {
-            GetComputerNameExW(
-                ComputerNamePhysicalDnsDomain,
-                Some(PWSTR(buffer.as_mut_ptr())),
-                &mut nsize,
-            )
-        }
-        .map_err(|e| anyhow!("GetComputerNameExW failed for DnsDomain: {e}"))?;
-
-        if unsafe {
-            StrCmpW(
-                PCWSTR(buffer.as_ptr()),
-                PCWSTR::from_raw(suffix_wide.as_ptr()),
-            )
-        } != 0
-        {
-            util::retry_std(|| unsafe {
-                SetComputerNameExW(
-                    ComputerNamePhysicalDnsDomain,
-                    PCWSTR::from_raw(suffix_wide.as_ptr()),
-                )
-            })
-            .map_err(|e| anyhow!("SetComputerNameExW failed for DnsDomain: {e}"))?;
-
-            needs_restart = true;
-        } else {
-            debug!("DnsDomain is already set to: {suffix}");
-        }
-    } else {
-        info!("FQDN does not contain a domain suffix, skipping DNS domain");
-    }
-
-    Ok(needs_restart)
-}
-
 fn get_ssh_dir() -> anyhow::Result<PathBuf> {
     let program_data_path =
         unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, KF_FLAG_DEFAULT, None) }
@@ -231,10 +141,15 @@ fn handle_ssh_keys(ssh_authorized_keys: &Vec<String>) -> anyhow::Result<()> {
     // Enable windows SSH
     info!("Installing and enabling Windows SSH server service");
     if let Err(e) = util::run_powershell_command(
-        r#"Add-WindowsCapability -Online -Name OpenSSH.Server;
+        r#"if (!(Get-WindowsCapability -Online -Name OpenSSH.Server -ErrorAction SilentlyContinue)) {
+            Add-WindowsCapability -Online -Name OpenSSH.Server;
+        }
         Start-Service sshd;
         Set-Service -Name sshd -StartupType "Automatic"
-        if (!(Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue)) {
+        $existingRule = Get-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -ErrorAction SilentlyContinue
+        if ($existingRule) {
+            Set-NetFirewallRule -Name "OpenSSH-Server-In-TCP" -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Any
+        } else {
             New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -Profile Any
         }
         if (!(Get-ItemProperty -Path "HKLM:\SOFTWARE\OpenSSH" -Name DefaultShell -ErrorAction SilentlyContinue)) {
@@ -290,7 +205,7 @@ fn handle_ssh_keys(ssh_authorized_keys: &Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn handle_user_data(user_data: &mut UserData) -> anyhow::Result<bool> {
+pub fn handle_user_data(user_data: &mut UserData) -> anyhow::Result<()> {
     debug!("Handling user data: {:?}", user_data);
 
     if user_data.disable_root {
@@ -354,14 +269,5 @@ pub fn handle_user_data(user_data: &mut UserData) -> anyhow::Result<bool> {
         warn!("package_upgrade is not supported");
     }
 
-    match update_hostname(&user_data.hostname, &user_data.fqdn) {
-        Ok(needs_restart) => {
-            return Ok(needs_restart);
-        }
-        Err(e) => {
-            error!("Failed to update hostname: {e}");
-        }
-    }
-
-    Ok(false)
+    Ok(())
 }

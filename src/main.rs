@@ -13,7 +13,7 @@ use log::{debug, error, info, warn};
 use secrecy::SecretBox;
 use serde::Deserialize;
 use windows::{
-    Win32::{
+    core::{w, PCWSTR, PWSTR}, Win32::{
         Foundation::{GetLastError, HANDLE, MAX_PATH},
         Security::{
             SE_PRIVILEGE_ENABLED, SE_SHUTDOWN_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
@@ -21,21 +21,14 @@ use windows::{
         Storage::FileSystem::{GetDriveTypeW, GetLogicalDriveStringsW, GetVolumeInformationW},
         System::{
             Com::{
-                COINIT_MULTITHREADED, CoInitializeEx, CoInitializeSecurity, CoUninitialize,
-                EOAC_NONE, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
-            },
-            Diagnostics::Debug::OutputDebugStringW,
-            Registry::HKEY_LOCAL_MACHINE,
-            Shutdown::{
+                CoInitializeEx, CoInitializeSecurity, CoUninitialize, COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE
+            }, Diagnostics::Debug::OutputDebugStringW, Registry::HKEY_LOCAL_MACHINE, Shutdown::{
                 InitiateSystemShutdownExW, SHTDN_REASON_FLAG_PLANNED,
                 SHTDN_REASON_MAJOR_OPERATINGSYSTEM, SHTDN_REASON_MINOR_RECONFIG,
-            },
-            Threading::{GetCurrentProcess, OpenProcessToken},
-            WindowsProgramming::DRIVE_CDROM,
+            }, SystemInformation::{ComputerNamePhysicalDnsDomain, ComputerNamePhysicalDnsHostname, GetComputerNameExW, SetComputerNameExW}, Threading::{GetCurrentProcess, OpenProcessToken}, WindowsProgramming::DRIVE_CDROM
         },
-        UI::Shell::{FOLDERID_ProgramFilesX64, KF_FLAG_DEFAULT, SHGetKnownFolderPath, StrCmpW},
-    },
-    core::{PCWSTR, w},
+        UI::Shell::{FOLDERID_ProgramFilesX64, SHGetKnownFolderPath, StrCmpW, KF_FLAG_DEFAULT},
+    }
 };
 use windows_service::{
     define_windows_service,
@@ -291,10 +284,95 @@ fn check_oobe_complete() -> anyhow::Result<bool> {
     return Ok(setup_in_progress == 0 && oobe_in_progress == 0);
 }
 
-fn run_service(install_dir: &PathBuf) -> anyhow::Result<()> {
-    info!("CloudInitWin started");
 
-    info!("Ensuring OOBE is complete");
+fn update_hostname(hostname: &str, fqdn: &str) -> anyhow::Result<bool> {
+    let mut needs_restart = false;
+
+    let hostname_wide = hostname
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+
+    let mut buffer = [0u16; 512 + 1];
+    let mut nsize = 512;
+    unsafe {
+        GetComputerNameExW(
+            ComputerNamePhysicalDnsHostname,
+            Some(PWSTR(buffer.as_mut_ptr())),
+            &mut nsize,
+        )
+    }
+    .map_err(|e| anyhow!("GetComputerNameExW failed for DnsHostname: {e}"))?;
+
+    if unsafe {
+        StrCmpW(
+            PCWSTR(buffer.as_ptr()),
+            PCWSTR::from_raw(hostname_wide.as_ptr()),
+        )
+    } != 0
+    {
+        util::retry_std(|| unsafe {
+            SetComputerNameExW(
+                ComputerNamePhysicalDnsHostname,
+                PCWSTR::from_raw(hostname_wide.as_ptr()),
+            )
+        })
+        .map_err(|e| anyhow!("SetComputerNameExW failed for DnsHostname: {e}"))?;
+
+        needs_restart = true;
+    } else {
+        debug!("DnsHostname is already set to: {hostname}");
+    }
+
+    if let Some((_, suffix)) = fqdn.split_once('.') {
+        debug!("Setting DNS domain to: {suffix}");
+
+        let suffix_wide = suffix
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>();
+
+        buffer.fill(0);
+        nsize = 512;
+        unsafe {
+            GetComputerNameExW(
+                ComputerNamePhysicalDnsDomain,
+                Some(PWSTR(buffer.as_mut_ptr())),
+                &mut nsize,
+            )
+        }
+        .map_err(|e| anyhow!("GetComputerNameExW failed for DnsDomain: {e}"))?;
+
+        if unsafe {
+            StrCmpW(
+                PCWSTR(buffer.as_ptr()),
+                PCWSTR::from_raw(suffix_wide.as_ptr()),
+            )
+        } != 0
+        {
+            util::retry_std(|| unsafe {
+                SetComputerNameExW(
+                    ComputerNamePhysicalDnsDomain,
+                    PCWSTR::from_raw(suffix_wide.as_ptr()),
+                )
+            })
+            .map_err(|e| anyhow!("SetComputerNameExW failed for DnsDomain: {e}"))?;
+
+            needs_restart = true;
+        } else {
+            debug!("DnsDomain is already set to: {suffix}");
+        }
+    } else {
+        info!("FQDN does not contain a domain suffix, skipping DNS domain");
+    }
+
+    Ok(needs_restart)
+}
+
+fn run_service(install_dir: &PathBuf) -> anyhow::Result<()> {
+    info!("CloudInitWin v{} started", env!("CARGO_PKG_VERSION"));
+
+    info!("Ensuring OOBE is complete before proceeding");
     while !check_oobe_complete().map_err(|e| anyhow!("Failed to check for OOBE completion: {e}"))? {
         debug!("Waiting...");
         std::thread::sleep(Duration::from_secs(1));
@@ -350,13 +428,9 @@ fn run_service(install_dir: &PathBuf) -> anyhow::Result<()> {
 
     // Handle user data first so it is more likely that we will be able to log in in the case of any errors
     info!("Handling user data");
-    let needs_restart = match user_data::handle_user_data(&mut user_data) {
-        Ok(needs_restart) => needs_restart,
-        Err(e) => {
-            error!("Failed to handle user data: {e}");
-            false
-        }
-    };
+    if let Err(e) = user_data::handle_user_data(&mut user_data) {
+        error!("Failed to handle user data: {e}");
+    }
 
     info!("Handling network config");
     if let Err(e) = network_config::handle_network_config(network_config) {
@@ -365,6 +439,12 @@ fn run_service(install_dir: &PathBuf) -> anyhow::Result<()> {
 
     info!("Extending partitions");
     volumes::extend_partitions().map_err(|e| anyhow!("Failed to extend partitions: {e}"))?;
+
+    info!("Updating hostname");
+    let needs_restart = update_hostname(&user_data.hostname, &user_data.fqdn).unwrap_or_else(|e| {
+        error!("Failed to update hostname: {e}");
+        false
+    });
 
     info!("Configuration finished");
 
