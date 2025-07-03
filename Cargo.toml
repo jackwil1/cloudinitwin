@@ -1,13 +1,24 @@
 [package]
-name = "cloudinitwin"
-version = "0.1.0"
+name = "CloudInitWin"
+version = "0.1.2"
+authors = ["jackwil1"]
+description = "Support for CloudInit on Windows with Proxmox"
+readme = "README.md"
+repository = "https://github.com/jackwil1/cloudinitwin"
+license = "GPL-3.0-or-later"
+publish = false
 edition = "2024"
+
+build = "build.rs"
+
+[build-dependencies]
+windows_exe_info = "0.5.2"
 
 [dependencies]
 log = "0.4.27"
 serde_json = "1.0.140"
 serde_yaml_ng = "0.10.0"
-flexi_logger = "0.31.1"
+flexi_logger = "0.31.2"
 anyhow = "1.0.98"
 nom = "8.0.0"
 scopeguard = "1.2.0"

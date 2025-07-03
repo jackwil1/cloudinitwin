@@ -1,5 +1,5 @@
-$exe     = Join-Path $PSScriptRoot "target\release\cloudinitwin.exe"
-$zip     = Join-Path $PSScriptRoot "cloudinitwin.zip"
+$exe     = Join-Path $PSScriptRoot "target\release\CloudInitWin.exe"
+$zip     = Join-Path $PSScriptRoot "CloudInitWin.zip"
 $scripts = Join-Path $PSScriptRoot "scripts"
 
 if (Test-Path $zip) {
